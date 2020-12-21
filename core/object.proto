@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package proto;
+
+message ObjectIndex {
+    uint32 id = 1;
+}
+
+message Vector2f {
+    float x = 1;
+    float y = 2;
+}
+
+message Color {
+    float r = 1;
+    float g = 2;
+    float b = 3;
+}
+
+message Object {
+    uint32 id = 1;
+    Color color = 2;
+    Vector2f position = 3;
+    Vector2f velocity = 4;
+    float rotation = 5;
+}
+
+message ObjectsVector {
+    repeated Object objects = 1;
+    repeated uint32 objects_to_delete = 2;
+    repeated uint32 me = 3;
+}
+
+message UserUpdate {
+    Vector2f velocity = 1;
+    float rotation = 2;
+}
