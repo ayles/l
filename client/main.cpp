@@ -1,179 +1,21 @@
+#include <client/shader_program.h>
+#include <client/dual_contour.h>
+#include <client/marching_cubes.h>
+#include <client/simplex.h>
+#include <client/iso_surface_generator.h>
+
 #include <gl/glew.h>
+#include <glm/glm.hpp>
+#include <glm/gtx/transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <glm/gtx/hash.hpp>
 #include <GLFW/glfw3.h>
+
 #include <iostream>
-#include <vector>
-#include <core/object.h>
-#include <unordered_map>
-#include <thread>
-#include <mutex>
-#include <enet/enet.h>
-#include <object.pb.h>
+#include <chrono>
+#include <memory>
+#include <tuple>
 
-
-GLuint compile_shader(const std::string& vertex_shader, const std::string& fragment_shader){
-    auto compile = [](const std::string& source, size_t type) {
-        std::cout << "Compiling " << (type == GL_VERTEX_SHADER ? "vertex" : "fragment") << " shader" << std::endl;
-
-        GLuint shader_id = glCreateShader(type);
-        const char* c = source.c_str();
-        glShaderSource(shader_id, 1, &c , nullptr);
-        glCompileShader(shader_id);
-
-        GLint result = GL_FALSE;
-        GLint info_log_length;
-        glGetShaderiv(shader_id, GL_COMPILE_STATUS, &result);
-        glGetShaderiv(shader_id, GL_INFO_LOG_LENGTH, &info_log_length);
-        if (info_log_length > 0){
-            std::vector<char> error_message(info_log_length + 1);
-            glGetShaderInfoLog(shader_id, info_log_length, nullptr, &error_message[0]);
-            std::cout << &error_message[0] << std::endl;
-        }
-
-        return shader_id;
-    };
-
-    GLuint vertex_shader_id = compile(vertex_shader, GL_VERTEX_SHADER);
-    GLuint fragment_shader_id = compile(fragment_shader, GL_FRAGMENT_SHADER);
-
-    std::cout << "Linking program" << std::endl;
-    GLuint program_id = glCreateProgram();
-    glAttachShader(program_id, vertex_shader_id);
-    glAttachShader(program_id, fragment_shader_id);
-    glLinkProgram(program_id);
-
-    GLint result = GL_FALSE;
-    GLint info_log_length;
-    glGetProgramiv(program_id, GL_LINK_STATUS, &result);
-    glGetProgramiv(program_id, GL_INFO_LOG_LENGTH, &info_log_length);
-    if (info_log_length > 0){
-        std::vector<char> error_message(info_log_length + 1);
-        glGetProgramInfoLog(program_id, info_log_length, nullptr, &error_message[0]);
-        std::cout << &error_message[0] << std::endl;
-    }
-
-    glDetachShader(program_id, vertex_shader_id);
-    glDetachShader(program_id, fragment_shader_id);
-
-    glDeleteShader(vertex_shader_id);
-    glDeleteShader(fragment_shader_id);
-
-    return program_id;
-}
-
-
-std::mutex global_lock;
-std::unordered_map<uint32_t, Object> world_objects;
-Eigen::Vector2f velocity;
-Eigen::Vector2f mouse_pos;
-float rotation = 0.0f;
-uint32_t me = 0;
-
-
-void network() {
-    if (enet_initialize() != 0) {
-        std::cout << "An error occurred while initializing ENet." << std::endl;
-        abort();
-    }
-
-    ENetAddress address;
-    ENetHost* client;
-    ENetPeer* server;
-
-    client = enet_host_create(nullptr, 1, 2, 0, 0);
-
-    if (!client) {
-        std::cout << "An error occurred while trying to create an ENet client host." << std::endl;
-        abort();
-    }
-
-    enet_address_set_host(&address, "127.0.0.1");
-    address.port = 8111;
-
-    server = enet_host_connect(client, &address, 2, 0);
-
-    if (!server) {
-        std::cout << "Can't start connecting." << std::endl;
-        abort();
-    }
-
-    std::cout << "ENet connecting started." << std::endl;
-
-    ENetEvent event;
-    if (enet_host_service(client, &event, 5000) <= 0 || event.type != ENET_EVENT_TYPE_CONNECT) {
-        std::cout << "Error connecting." << std::endl;
-        abort();
-    }
-
-    while (enet_host_service(client, &event, 10) >= 0) {
-        const std::lock_guard<std::mutex> lock(global_lock);
-
-        switch (event.type) {
-            case ENET_EVENT_TYPE_RECEIVE: {
-                //printf("A packet of length %u containing %s was received from %s on channel %u.\n", event.packet->dataLength, event.packet->data, event.peer->data, event.channelID);
-
-                proto::ObjectsVector objects_vector;
-                objects_vector.ParseFromArray(event.packet->data, event.packet->dataLength);
-
-                auto update_object = [](const proto::Object& proto_object) {
-                    Object& object = world_objects[proto_object.id()];
-                    object.id = proto_object.id();
-                    object.color = Eigen::Vector3f(proto_object.color().r(), proto_object.color().g(), proto_object.color().b());
-                    object.position = Eigen::Vector2f(proto_object.position().x(), proto_object.position().y());
-                    object.velocity = Eigen::Vector2f(proto_object.velocity().x(), proto_object.velocity().y());
-                    object.rotation = proto_object.rotation();
-                };
-
-                for (const proto::Object& proto_object : objects_vector.objects()) {
-                    update_object(proto_object);
-                }
-
-                for (uint32_t id : objects_vector.objects_to_delete()) {
-                    world_objects.erase(id);
-                }
-
-                if (objects_vector.me().size()) {
-                    me = objects_vector.me(0);
-                }
-
-                enet_packet_destroy(event.packet);
-                break;
-            }
-
-            case ENET_EVENT_TYPE_DISCONNECT: {
-                printf("Connection closed.\n", event.peer->address.host);
-                abort();
-            }
-
-            default:
-                break;
-        }
-
-        if (world_objects.contains(me)) {
-            Eigen::Vector2f diff = mouse_pos - world_objects.at(me).position;
-            rotation = std::atan2(diff.y(), diff.x());
-        }
-
-        proto::UserUpdate uu;
-        uu.mutable_velocity()->set_x(velocity.x());
-        uu.mutable_velocity()->set_y(velocity.y());
-        uu.set_rotation(rotation);
-
-        auto data = uu.SerializeAsString();
-        ENetPacket* packet = enet_packet_create(data.data(), data.size(), ENET_PACKET_FLAG_RELIABLE);
-        enet_peer_send(server, 0, packet);
-    }
-
-    enet_peer_reset(server);
-    enet_host_destroy(client);
-    enet_deinitialize();
-}
-
-
-void update_mouse_pos(GLFWwindow* window, double x, double y) {
-    int width, height;
-    glfwGetWindowSize(window, &width, &height);
-    mouse_pos = Eigen::Vector2f(x, height - y - 1) / 25.0f;
-}
 
 void window_size_callback(GLFWwindow* window, int x, int y) {
     glViewport(0, 0, x, y);
@@ -207,64 +49,152 @@ int main() {
 
     glfwSetInputMode(window, GLFW_STICKY_KEYS, GL_TRUE);
 
-    glfwSetCursorPosCallback(window, update_mouse_pos);
     glfwSetWindowSizeCallback(window, window_size_callback);
 
     glClearColor(0.874509804f, 0.874509804f, 0.874509804f, 0.0f);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
 
-    GLuint vao_id;
-    glGenVertexArrays(1, &vao_id);
-    glBindVertexArray(vao_id);
+    GLuint vaoId;
+    glGenVertexArrays(1, &vaoId);
+    glBindVertexArray(vaoId);
 
-    GLuint program_id = compile_shader(
+    ShaderProgram shaderProgram = ShaderProgram::Compile(
 R"(#version 330 core
 
 layout(location = 0) in vec3 vertex;
-uniform float rotation;
-uniform vec2 position;
-uniform vec2 window_size;
+layout(location = 1) in vec3 normal;
+
+out vec3 norm;
+
+uniform mat4 mvp;
+uniform mat4 nmat;
 
 void main() {
-    vec2 v = vertex.xy;
-    v = vec2(v.x * cos(rotation) - v.y * sin(rotation), v.x * sin(rotation) + v.y * cos(rotation));
-    gl_Position.xyz = vec3((v.x + position.x) / window_size.x, (v.y + position.y) / window_size.y, vertex.z) * 25;
-    gl_Position.xyz = gl_Position.xyz * 2 - 1;
-    gl_Position.w = 1.0;
+    gl_Position = mvp * vec4(vertex, 1.0);
+    norm = (nmat * vec4(normal, 0.0)).xyz;
 })",
 
 R"(#version 330 core
 
-uniform vec3 color;
-out vec3 out_color;
+out vec4 outColor;
+in vec3 norm;
+
+const vec3 light = -normalize(vec3(2, -4, -1));
 
 void main() {
-	out_color = color;
+    float d = dot(vec3(0, 1, 0), norm);
+    d = clamp(d, 0, 1);
+    vec3 col = (vec3(136,113,171) * d + vec3(158,163,245) * (1 - d)) / 255.0;
+	outColor = vec4(col * clamp(dot(norm, light), 0, 1), 1);
 })");
 
-    static const GLfloat g_vertex_buffer_data[] = {
-        -1.0f, -1.0f, 0.0f,
-        1.0f, 0.0f, 0.0f,
-        -1.0f, 1.0f, 0.0f,
+    ShaderProgram axisProgram = ShaderProgram::Compile(
+        R"(#version 330 core
+
+layout(location = 0) in vec3 vertex;
+out vec3 p;
+
+uniform mat4 vp;
+
+void main() {
+    gl_Position = vp * vec4(vertex, 1.0);
+    p = vertex;
+})",
+
+        R"(#version 330 core
+
+out vec4 outColor;
+in vec3 p;
+
+void main() {
+	outColor = vec4(p.xyz, 1);
+})");
+
+    GLuint vboIds[4];
+    glGenBuffers(4, vboIds);
+    shaderProgram.Bind();
+
+    glm::mat4 projection = glm::perspective(glm::radians(70.0f), 1024.0f / 768.0f, 0.01f, 100.0f);
+    glm::mat4 view;
+    glm::mat4 model(1.0f);
+
+    std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
+    float elapsed = 0.0f;
+    bool p = false;
+    bool pp = false;
+    bool ppp = false;
+    bool pppp = false;
+    bool r = false;
+
+    auto normalFromFunction = [](std::function<float(float, float, float)> f, float d = 0.01) {
+        return [f, d](float x, float y, float z) {
+            return -glm::normalize(glm::vec3(
+                (f(x + d, y, z) - f(x - d, y, z)),
+                (f(x, y + d, z) - f(x, y - d, z)),
+                (f(x, y, z + d) - f(x, y, z - d))) / 2.0f / d);
+        };
     };
 
-    GLuint vbo_id;
-    glGenBuffers(1, &vbo_id);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo_id);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(g_vertex_buffer_data), g_vertex_buffer_data, GL_STATIC_DRAW);
-    glUseProgram(program_id);
 
-    GLint color_loc = glGetUniformLocation(program_id, "color");
-    GLint pos_loc = glGetUniformLocation(program_id, "position");
-    GLint rot_loc = glGetUniformLocation(program_id, "rotation");
-    GLint window_size_loc = glGetUniformLocation(program_id, "window_size");
+    auto f = [&elapsed](float x, float y, float z) {
+        float factor = std::max(0.0f, std::max(std::abs(x) - 10, std::max(std::abs(y) - 10, std::abs(z) - 10))) / 7.0f;
+        factor *= factor;
+        return
+            Simplex::noise(glm::vec4(x / 20, 0, z / 20, elapsed / 3.0f)) * 0.7f +
+            Simplex::noise(glm::vec4(x / 10, 0, z / 10, elapsed / 3.0f)) * 0.3f +
+            //Simplex::noise(glm::vec4(x / 4, 0, z / 4, elapsed / 3.0f)) * 0.0f +
+            - y / 10.0f;
+        //return Simplex::noise(glm::vec4(x / 10, 0, z / 10, elapsed / 3.0f)) - y / 10.0f;// - factor;
+    };
 
-    std::thread network_thread(&network);
+    auto nrm = normalFromFunction(f, 0.01);
+    auto ff = [&f, &nrm](const glm::vec3& p) {
+        return DualContour::Point {
+            (float)f(p.x, p.y, p.z),
+            nrm(p.x, p.y, p.z)
+        };
+    };
+
+    std::array<std::shared_ptr<IIsoSurfaceGenerator>, 2> gens = { std::shared_ptr<IIsoSurfaceGenerator>(new MarchingCubes), std::shared_ptr<IIsoSurfaceGenerator>(new DualContour) };
+    gens[0]->SetVolumeProvider(ff);
+    gens[1]->SetVolumeProvider(ff);
+
+    const float axis[18] {
+        0.0f, 0.0f, 0.0f, 100.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f, 100.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 100.0f,
+    };
+
+    glBindBuffer(GL_ARRAY_BUFFER, vboIds[3]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(axis), axis, GL_STATIC_DRAW);
+
+    IIsoSurfaceGenerator::Mesh* mesh = &gens[0]->Generate(glm::ivec3(-3), glm::ivec3(3));
 
     do {
-        glClear(GL_COLOR_BUFFER_BIT);
-        glEnableVertexAttribArray(0);
-        glBindBuffer(GL_ARRAY_BUFFER, vbo_id);
+        float delta = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - start).count() / 1'000'000'000.0f;
+        if (r) {
+            elapsed += delta;
+        }
+        start = std::chrono::high_resolution_clock::now();
 
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glEnableVertexAttribArray(0);
+        glEnableVertexAttribArray(1);
+
+        if (r) {
+            mesh = &gens[0]->Generate(glm::ivec3(-3), glm::ivec3(3));
+        }
+
+        glBindBuffer(GL_ARRAY_BUFFER, vboIds[0]);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 3 * mesh->Vertices.size(), glm::value_ptr(mesh->Vertices[0]), GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, vboIds[1]);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 3 * mesh->Normals.size(), glm::value_ptr(mesh->Normals[0]), GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, vboIds[2]);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(unsigned int) * mesh->Indices.size(), mesh->Indices.data(), GL_DYNAMIC_DRAW);
+
+        glBindBuffer(GL_ARRAY_BUFFER, vboIds[0]);
         glVertexAttribPointer(
             0,                  // attribute 0. No particular reason for 0, but must match the layout in the shader.
             3,                  // size
@@ -274,34 +204,88 @@ void main() {
             nullptr             // array buffer offset
         );
 
-        int width, height;
-        glfwGetWindowSize(window, &width, &height);
-        glUniform2f(window_size_loc, width, height);
+        glBindBuffer(GL_ARRAY_BUFFER, vboIds[1]);
+        glVertexAttribPointer(
+            1,                  // attribute 0. No particular reason for 0, but must match the layout in the shader.
+            3,                  // size
+            GL_FLOAT,           // type
+            GL_FALSE,           // normalized?
+            0,                  // stride
+            nullptr             // array buffer offset
+        );
 
-        {
-            const std::lock_guard<std::mutex> lock(global_lock);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, vboIds[2]);
 
-            velocity = Eigen::Vector2f(
-                (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) - (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS),
-                (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) - (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS));
+        view = glm::lookAt(glm::vec3(std::sin(elapsed / 10) * 25, 15, std::cos(elapsed / 10) * 25), glm::vec3(0, 0, 0), glm::vec3(0, 1, 0));
+        //model *= glm::rotate(delta, glm::vec3(1, 0, 0));
 
-            for (const auto&[id, object] : world_objects) {
-                glUniform2f(pos_loc, object.position.x(), object.position.y());
-                glUniform3f(color_loc, object.color.x(), object.color.y(), object.color.z());
-                glUniform1f(rot_loc, object.rotation);
-                glDrawArrays(GL_TRIANGLES, 0, 3);
-            }
+        shaderProgram.Bind();
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram.ProgramId_, "mvp"), 1, GL_FALSE, glm::value_ptr(projection * view * model));
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram.ProgramId_, "nmat"), 1, GL_FALSE, glm::value_ptr(glm::transpose(glm::inverse(model))));
+
+        if (mesh->Indices.empty()) {
+            glDrawArrays(GL_TRIANGLES, 0, mesh->Count);
+        } else {
+            glDrawElements(GL_TRIANGLES, mesh->Count, GL_UNSIGNED_INT, nullptr);
         }
 
+
+        glBindBuffer(GL_ARRAY_BUFFER, vboIds[3]);
+        glVertexAttribPointer(
+            0,
+            3,
+            GL_FLOAT,
+            GL_FALSE,
+            0,
+            nullptr
+        );
+        axisProgram.Bind();
+        glUniformMatrix4fv(glGetUniformLocation(axisProgram.ProgramId_, "vp"), 1, GL_FALSE, glm::value_ptr(projection * view));
+        glDrawArrays(GL_LINES, 0, 18);
+
+
+        glDisableVertexAttribArray(1);
         glDisableVertexAttribArray(0);
 
         glfwSwapBuffers(window);
         glfwPollEvents();
+
+        if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) {
+            if (!p) {
+                GLint mode;
+                glGetIntegerv(GL_POLYGON_MODE, &mode);
+                glPolygonMode(GL_FRONT_AND_BACK, mode == GL_LINE ? GL_FILL : GL_LINE);
+            }
+        }
+        p = glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
+
+        if (glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS) {
+            if (!pp) {
+                gens[0]->SetHardNormals(!gens[0]->GetHardNormals());
+            }
+        }
+        pp = glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS;
+
+
+        if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
+            if (!ppp) {
+                std::swap(gens[0], gens[1]);
+                gens[0]->SetHardNormals(gens[1]->GetHardNormals());
+            }
+        }
+        ppp = glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS;
+
+        if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
+            if (!pppp) {
+                r = !r;
+            }
+        }
+        pppp = glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS;
+        //std::cout << 1.0f / delta << std::endl;
     } while (glfwGetKey(window, GLFW_KEY_ESCAPE) != GLFW_PRESS && glfwWindowShouldClose(window) == 0);
 
-    glDeleteBuffers(1, &vbo_id);
-    glDeleteVertexArrays(1, &vao_id);
-    glDeleteProgram(program_id);
+    glDeleteBuffers(4, vboIds);
+    glDeleteVertexArrays(1, &vaoId);
 
     glfwTerminate();
 
